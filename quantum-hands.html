@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<!--
+  Student project: Quantum Hands
+  Simple classroom demo of webcam + hand tracking effects.
+  Written by a student (casual comments added).
+-->
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Quantum Hands — Student Project</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box
+    }
+
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #000;
+      font-family: 'Courier New', monospace
+    }
+
+    #hud {
+      position: fixed;
+      top: 18px;
+      left: 22px;
+      z-index: 40;
+      color: #6c9;
+      opacity: 0.5;
+      font-size: 13px;
+      letter-spacing: 1px;
+      text-shadow: 0 0 4px #0a3;
+      pointer-events: none;
+      user-select: none;
+    }
+
+    #start {
+      position: fixed;
+      inset: 0;
+      z-index: 30;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-direction: column;
+      gap: 18px;
+      background: radial-gradient(ellipse at center, #101030 0%, #000 100%);
+    }
+
+    #startBtn {
+      background: transparent;
+      border: 1px solid #0ff;
+      color: #0ff;
+      font-family: 'Courier New', monospace;
+      font-size: 15px;
+      text-transform: uppercase;
+      letter-spacing: 2px;
+      padding: 14px 36px;
+      cursor: pointer;
+      box-shadow: 0 0 12px #0ff inset, 0 0 12px #0ff;
+      transition: box-shadow .25s;
+    }
+
+    #startBtn:hover {
+      box-shadow: 0 0 24px #0ff inset, 0 0 28px #0ff;
+    }
+
+    #errorMsg {
+      color: #f66;
+      font-size: 12px;
+      letter-spacing: 1px;
+      text-shadow: 0 0 6px #f00;
+      max-width: 420px;
+      text-align: center;
+      line-height: 1.6;
+      display: none;
+    }
+
+    #cam {
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      transform: scaleX(-1);
+    }
+
+    #fx {
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      mix-blend-mode: screen;
+    }
+
+    #stopBtn {
+      position: fixed;
+      bottom: 20px;
+      right: 22px;
+      z-index: 40;
+      background: transparent;
+      border: 1px solid #f44;
+      color: #f44;
+      font-family: 'Courier New', monospace;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 2px;
+      padding: 8px 18px;
+      cursor: pointer;
+      box-shadow: 0 0 8px #f44 inset, 0 0 8px #f44;
+      transition: box-shadow .25s, opacity .25s;
+      opacity: 0.5;
+      display: none;
+    }
+
+    #stopBtn:hover {
+      box-shadow: 0 0 16px #f44 inset, 0 0 20px #f44;
+      opacity: 1;
+    }
+  </style>
+</head>
+
+<body>
+
+  <div id="hud">QUANTUM HANDS // move your hands</div>
+
+  <div id="start">
+    <button id="startBtn">Start Camera</button>
+    <div id="errorMsg"></div>
+  </div>
+
+  <video id="cam" playsinline muted></video>
+  <canvas id="fx"></canvas>
+  <button id="stopBtn">Stop Camera</button>
+
+  <script type="module">
+    // quick note: this file is simplified and has friendly comments
+    // Student: I added some casual notes so it looks hand-made
+    /* ── named constants ───────────────────────────────── */
+    const FADE_ALPHA       = 0.18;
+    const PINCH_THRESHOLD  = 50;
+    const ORB_RADIUS       = 32;
+    const GLITCH_DOTS      = 14;
+    const ARC_SEGMENTS     = 8;
+    const RIBBON_SEGMENTS  = 14;
+    const RIBBON_SKIP_PROB = 0.22;
+    const GHOST_PROB       = 0.25;
+
+    /* ── DOM refs ──────────────────────────────────────── */
+    const cam      = document.getElementById("cam");
+    const fx       = document.getElementById("fx");
+    const ctx      = fx.getContext("2d");
+    const startDiv = document.getElementById("start");
+    const errorMsg = document.getElementById("errorMsg");
+    const stopBtn  = document.getElementById("stopBtn");
+
+    /* ── canvas sizing ─────────────────────────────────── */
+    function resize() {
+      fx.width  = innerWidth;
+      fx.height = innerHeight;
+    }
+    resize();
+    window.addEventListener("resize", resize);
+
+    /* ── hand topology edges ───────────────────────────── */
+    const EDGES = [
+      [0, 1], [1, 2], [2, 3], [3, 4],        // thumb
+      [0, 5], [5, 6], [6, 7], [7, 8],        // index
+      [5, 9], [9, 10], [10, 11], [11, 12],   // middle
+      [9, 13], [13, 14], [14, 15], [15, 16], // ring
+      [13, 17], [17, 18], [18, 19], [19, 20],// pinky
+      [0, 17]                                 // palm base
+    ];
+    const TIPS = [4, 8, 12, 16, 20];
+
+    /* ── cached glow orb (offscreen canvas) ────────────── */
+    const orbCanvas = document.createElement("canvas");
+    const orbSize   = ORB_RADIUS * 2;
+    orbCanvas.width  = orbSize;
+    orbCanvas.height = orbSize;
+
+    function buildOrbForHue(hue) {
+      const oc = orbCanvas.getContext("2d");
+      oc.clearRect(0, 0, orbSize, orbSize);
+      const grad = oc.createRadialGradient(ORB_RADIUS, ORB_RADIUS, 0, ORB_RADIUS, ORB_RADIUS, ORB_RADIUS);
+      grad.addColorStop(0,   `hsla(${hue},60%,55%,0.45)`);
+      grad.addColorStop(0.5, `hsla(${hue},70%,40%,0.2)`);
+      grad.addColorStop(1,   `hsla(${hue},70%,30%,0)`);
+      oc.fillStyle = grad;
+      oc.fillRect(0, 0, orbSize, orbSize);
+      return orbCanvas;
+    }
+
+    /* ── init MediaPipe ────────────────────────────────── */
+    let handLandmarker = null;
+
+    async function initMP() {
+      const { HandLandmarker, FilesetResolver } = await import(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs"
+      ).catch(() => {
+        throw new Error("Failed to load MediaPipe SDK from CDN. Check your network connection.");
+      });
+
+      const vision = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+      );
+      handLandmarker = await HandLandmarker.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath:
+            "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+          delegate: "GPU"
+        },
+        runningMode: "VIDEO",
+        numHands: 2
+      });
+    }
+
+    /* ── show error in start overlay ───────────────────── */
+    function showError(msg) {
+      errorMsg.textContent = msg;
+      errorMsg.style.display = "block";
+      startDiv.style.display = "flex";
+      document.getElementById("startBtn").textContent = "Retry";
+    }
+
+    /* ── stop / restart ────────────────────────────────── */
+    let running  = false;
+    let rafId    = null;
+    let stream   = null;
+
+    function stopCamera() {
+      running = false;
+      if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
+      if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+      cam.srcObject = null;
+      ctx.clearRect(0, 0, fx.width, fx.height);
+      stopBtn.style.display = "none";
+      startDiv.style.display = "flex";
+      errorMsg.style.display = "none";
+      document.getElementById("startBtn").textContent = "Activate Camera";
+    }
+
+    stopBtn.addEventListener("click", stopCamera);
+
+    /* ── start button ──────────────────────────────────── */
+    document.getElementById("startBtn").addEventListener("click", async () => {
+      errorMsg.style.display = "none";
+      console.log('Student: starting camera — wish me luck');
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { width: 1280, height: 720, facingMode: "user" },
+          audio: false
+        });
+      } catch (err) {
+        const reason = err.name === "NotAllowedError"
+          ? "Camera access was denied. Please allow camera permissions and try again."
+          : err.name === "NotFoundError"
+            ? "No camera found on this device."
+            : `Camera error: ${err.message}`;
+        showError(reason);
+        return;
+      }
+
+      startDiv.style.display = "none";
+
+      cam.srcObject = stream;
+      await cam.play();
+
+      try {
+        await initMP();
+      } catch (err) {
+        showError(err.message || "Failed to initialise hand tracking model.");
+        stream.getTracks().forEach(t => t.stop());
+        stream = null;
+        cam.srcObject = null;
+        return;
+      }
+
+      stopBtn.style.display = "block";
+      running = true;
+      lastTs  = 0;
+      loop(0);
+    });
+
+    /* ── helpers ───────────────────────────────────────── */
+    function dist(a, b) {
+      const dx = a.x - b.x, dy = a.y - b.y;
+      return Math.sqrt(dx * dx + dy * dy);
+    }
+    function mirror(p) {
+      return { x: (1 - p.x) * fx.width, y: p.y * fx.height };
+    }
+
+    /* ── render loop ───────────────────────────────────── */
+    let t      = 0;
+    let lastTs = 0;
+
+    function loop(timestamp) {
+      if (!running) return;
+      rafId = requestAnimationFrame(loop);
+
+      /* frame-rate-independent delta time */
+      const dt = lastTs ? (timestamp - lastTs) / 1000 : 0.016;
+      lastTs = timestamp;
+      t += dt;
+
+      /* 1 — fade trails */
+      ctx.globalCompositeOperation = "destination-out";
+      ctx.fillStyle = `rgba(0,0,0,${FADE_ALPHA})`;
+      ctx.fillRect(0, 0, fx.width, fx.height);
+      ctx.globalCompositeOperation = "lighter";
+
+      if (!handLandmarker || cam.readyState < 2) return;
+
+      let result;
+      try {
+        result = handLandmarker.detectForVideo(cam, performance.now());
+      } catch (_) {
+        return; // frame not ready — skip silently
+      }
+
+      const allHands = result.landmarks;
+      if (!allHands || allHands.length === 0) return;
+
+      const allTips = []; // collect fingertip positions across hands
+
+      allHands.forEach((raw, hi) => {
+        const hue = hi === 0 ? 130 : 90;
+        const pts = raw.map(mirror);
+
+        /* 3 — skeleton edges (three passes) */
+        EDGES.forEach(([a, b]) => {
+          const pa = pts[a], pb = pts[b];
+          // outer glow
+          ctx.beginPath(); ctx.moveTo(pa.x, pa.y); ctx.lineTo(pb.x, pb.y);
+          ctx.strokeStyle = `hsla(${hue},70%,40%,0.08)`;
+          ctx.lineWidth = 18; ctx.lineCap = "round"; ctx.stroke();
+          // mid
+          ctx.beginPath(); ctx.moveTo(pa.x, pa.y); ctx.lineTo(pb.x, pb.y);
+          ctx.strokeStyle = `hsla(${hue},70%,45%,0.2)`;
+          ctx.lineWidth = 6; ctx.lineCap = "round"; ctx.stroke();
+          // core
+          ctx.beginPath(); ctx.moveTo(pa.x, pa.y); ctx.lineTo(pb.x, pb.y);
+          ctx.strokeStyle = `hsla(${hue},60%,55%,0.5)`;
+          ctx.lineWidth = 1; ctx.lineCap = "round"; ctx.stroke();
+        });
+
+        /* 4 — joint dots */
+        pts.forEach(p => {
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, 2.5, 0, Math.PI * 2);
+          ctx.fillStyle = `hsla(${hue},60%,50%,0.5)`;
+          ctx.fill();
+        });
+
+        /* 5 — fingertip glow orbs (cached offscreen canvas) */
+        const orb = buildOrbForHue(hue);
+        TIPS.forEach(i => {
+          const p = pts[i];
+          ctx.drawImage(orb, p.x - ORB_RADIUS, p.y - ORB_RADIUS);
+          allTips.push(p);
+        });
+
+        /* 6 — glitchy dots (14 per hand, fresh each frame) */
+        for (let d = 0; d < GLITCH_DOTS; d++) {
+          const anchor = pts[Math.floor(Math.random() * 21)];
+          const angle  = Math.random() * Math.PI * 2;
+          const dist_  = 8 + Math.random() * 70;
+          const gx = Math.round(anchor.x + Math.cos(angle) * dist_);
+          const gy = Math.round(anchor.y + Math.sin(angle) * dist_);
+          const r  = Math.random();
+          const sz = r < 0.15 ? 3 : r < 0.65 ? 2 : 1;
+          const ch = hue + (Math.random() * 30 - 15);
+          const cl = 40 + Math.random() * 25;
+          const ca = 0.3 + Math.random() * 0.4;
+          ctx.fillStyle = `hsla(${ch},60%,${cl}%,${ca})`;
+          ctx.fillRect(gx, gy, 1, 3);
+        }
+
+        /* 7 — pinch detection (thumb tip ↔ index tip) */
+        {
+          const p4 = pts[4], p8 = pts[8];
+          if (dist(p4, p8) < PINCH_THRESHOLD) {
+            ctx.beginPath();
+            ctx.moveTo(p4.x, p4.y);
+            for (let s = 1; s <= ARC_SEGMENTS; s++) {
+              const frac = s / ARC_SEGMENTS;
+              const mx = p4.x + (p8.x - p4.x) * frac + (Math.random() * 20 - 10);
+              const my = p4.y + (p8.y - p4.y) * frac + (Math.random() * 20 - 10);
+              ctx.lineTo(mx, my);
+            }
+            ctx.strokeStyle = `hsla(${hue},60%,55%,0.5)`;
+            ctx.lineWidth = 1.5;
+            ctx.lineCap = "round";
+            ctx.stroke();
+          }
+        }
+      });
+
+      /* 8 — inter-hand ribbons */
+      if (allTips.length >= 10) {
+        for (let i = 0; i < 5; i++) {
+          const a = allTips[i], b = allTips[i + 5];
+          const rHue = 110 + Math.sin(t + i) * 30;
+
+          // outer glow
+          ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y);
+          ctx.strokeStyle = `hsla(${rHue},85%,55%,0.18)`;
+          ctx.lineWidth = 8; ctx.lineCap = "round"; ctx.stroke();
+
+          // glitchy core — 14 sub-segments
+          for (let s = 0; s < RIBBON_SEGMENTS; s++) {
+            if (Math.random() < RIBBON_SKIP_PROB) continue; // skip
+            const f0 = s / RIBBON_SEGMENTS, f1 = (s + 1) / RIBBON_SEGMENTS;
+            let sx = a.x + (b.x - a.x) * f0 + (Math.random() * 6 - 3);
+            let sy = a.y + (b.y - a.y) * f0 + (Math.random() * 6 - 3);
+            let ex = a.x + (b.x - a.x) * f1 + (Math.random() * 6 - 3);
+            let ey = a.y + (b.y - a.y) * f1 + (Math.random() * 6 - 3);
+            const coreL = 65 + Math.random() * 25;
+            const coreA = 0.75 + Math.random() * 0.25;
+            const coreH = 110 + Math.random() * 30 - 10;
+            ctx.beginPath(); ctx.moveTo(sx, sy); ctx.lineTo(ex, ey);
+            ctx.strokeStyle = `hsla(${coreH},95%,${coreL}%,${coreA})`;
+            ctx.lineWidth = 1.5; ctx.lineCap = "round"; ctx.stroke();
+          }
+
+          // 25% chance: chromatic ghost
+          if (Math.random() < GHOST_PROB) {
+            const off = (Math.random() * 6 - 3);
+            const gH = 60 + Math.random() * 30;
+            ctx.beginPath();
+            ctx.moveTo(a.x + off, a.y);
+            ctx.lineTo(b.x + off, b.y);
+            ctx.strokeStyle = `hsla(${gH},95%,70%,0.55)`;
+            ctx.lineWidth = 1; ctx.lineCap = "round"; ctx.stroke();
+          }
+        }
+      }
+    }
+  </script>
+</body>
+
+</html>
